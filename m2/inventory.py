@@ -27,12 +27,18 @@ from m2.effects import EffectClassifier, EffectType
 from m2.predicates import (
     PREDICATE_CATALOG,
     action_enabled,
+    adjacent_objects,
     color_at,
+    distance,
     empty,
+    front,
+    front_has_object,
+    front_is_empty,
     in_bounds,
     object_cells,
     occupied,
     on_border,
+    relative_position,
     touches_border,
 )
 from m2.trajectory import DataCompleteness, Trajectory
@@ -403,6 +409,7 @@ class InventoryBuilder:
         """Build predicate frequency statistics from full trajectories.
 
         Only evaluates predicates on transitions with full snapshots.
+        Uses FULL-GRID evaluation (no sampling) for P1 predicates.
         """
         stats: dict[str, int] = {}  # predicate → true_count
         evals: dict[str, int] = {}  # predicate → eval_count
@@ -423,11 +430,13 @@ class InventoryBuilder:
                     stats[key] = stats.get(key, 0) + (1 if val else 0)
                     evals[key] = evals.get(key, 0) + 1
 
-                # P1: Grid predicates — sample cells
+                # P1: Grid predicates — FULL GRID (no sampling)
                 h, w = len(cs.grid), len(cs.grid[0]) if cs.grid else 0
-                for r in range(min(h, 8)):  # Cap at 8x8 sample for performance
-                    for c in range(min(w, 8)):
+                colors_present: set[int] = set()
+                for r in range(h):
+                    for c in range(w):
                         cell = (r, c)
+                        colors_present.add(cs.grid[r][c])
                         for pred_name, pred_fn in [
                             ("InBounds", lambda s, c=cell: in_bounds(s, c)),
                             ("Occupied", lambda s, c=cell: occupied(s, c)),
@@ -438,18 +447,28 @@ class InventoryBuilder:
                             stats[pred_name] = stats.get(pred_name, 0) + (1 if val else 0)
                             evals[pred_name] = evals.get(pred_name, 0) + 1
 
-                        # ColorAt — evaluate for top 4 colors
-                        colors_present = set()
-                        for r2 in range(min(h, 8)):
-                            for c2 in range(min(w, 8)):
-                                colors_present.add(cs.grid[r2][c2])
-                        for color in sorted(colors_present)[:4]:
+                        # ColorAt — evaluate for all colors present in grid
+                        for color in sorted(colors_present):
                             key = f"ColorAt({color})"
                             val = color_at(cs, cell, color)
                             stats[key] = stats.get(key, 0) + (1 if val else 0)
                             evals[key] = evals.get(key, 0) + 1
 
-                # P3/P4: Object predicates
+                # P2: Directional predicates — all cells × 4 directions
+                for r in range(h):
+                    for c in range(w):
+                        cell = (r, c)
+                        for direction in ("up", "down", "left", "right"):
+                            for pred_name, pred_fn in [
+                                ("Front", lambda s, c=cell, d=direction: front(s, c, d)),
+                                ("FrontIsEmpty", lambda s, c=cell, d=direction: front_is_empty(s, c, d)),
+                                ("FrontHasObject", lambda s, c=cell, d=direction: front_has_object(s, c, d)),
+                            ]:
+                                val = pred_fn(cs)
+                                stats[pred_name] = stats.get(pred_name, 0) + (1 if val else 0)
+                                evals[pred_name] = evals.get(pred_name, 0) + 1
+
+                # P3: Object predicates — all objects
                 for obj in cs.objects:
                     obj_id = obj.object_id
                     for pred_name, pred_fn in [
@@ -459,6 +478,31 @@ class InventoryBuilder:
                         val = pred_fn(cs)
                         stats[pred_name] = stats.get(pred_name, 0) + (1 if val else 0)
                         evals[pred_name] = evals.get(pred_name, 0) + 1
+
+                # P4: Object relation predicates — all ordered pairs
+                obj_ids = [o.object_id for o in cs.objects]
+                for i, oid1 in enumerate(obj_ids):
+                    for j, oid2 in enumerate(obj_ids):
+                        if i == j:
+                            continue
+                        for pred_name, pred_fn in [
+                            ("AdjacentObjects", lambda s, a=oid1, b=oid2, d="right": adjacent_objects(s, a, b, d)),
+                        ]:
+                            val = pred_fn(cs)
+                            stats[pred_name] = stats.get(pred_name, 0) + (1 if val else 0)
+                            evals[pred_name] = evals.get(pred_name, 0) + 1
+                        # RelativePosition and Distance are computed once per pair
+                        if i < j:
+                            rp = relative_position(cs, oid1, oid2)
+                            if rp:
+                                key = f"RelativePosition({rp})"
+                                stats[key] = stats.get(key, 0) + 1
+                                evals[key] = evals.get(key, 0) + 1
+                            dist = distance(cs, oid1, oid2)
+                            if dist is not None:
+                                key = f"Distance({dist})"
+                                stats[key] = stats.get(key, 0) + 1
+                                evals[key] = evals.get(key, 0) + 1
 
         # Build PredicateStats for each predicate
         result: dict[str, PredicateStats] = {}
@@ -508,9 +552,9 @@ class InventoryBuilder:
                     if action_enabled(cs, aid):
                         predicates_true.append(f"ActionEnabled({aid})")
 
-                # P1 (sample)
-                for r in range(min(h, 4)):
-                    for c in range(min(w, 4)):
+                # P1 (full grid)
+                for r in range(h):
+                    for c in range(w):
                         cell = (r, c)
                         if occupied(cs, cell):
                             predicates_true.append("Occupied")
@@ -521,6 +565,26 @@ class InventoryBuilder:
                 for obj in cs.objects:
                     if touches_border(cs, obj.object_id):
                         predicates_true.append("TouchesBorder")
+
+                # P2 (directional — sample: 4 corners + center for each direction)
+                p2_sample_cells = [(0, 0), (0, w - 1), (h - 1, 0), (h - 1, w - 1)]
+                if h > 2 and w > 2:
+                    p2_sample_cells.append((h // 2, w // 2))
+                for cell in p2_sample_cells:
+                    for direction in ("up", "down", "left", "right"):
+                        if front_is_empty(cs, cell, direction):
+                            predicates_true.append("FrontIsEmpty")
+                        if front_has_object(cs, cell, direction):
+                            predicates_true.append("FrontHasObject")
+
+                # P4 (object relations — all ordered pairs)
+                obj_ids = [o.object_id for o in cs.objects]
+                for i in range(len(obj_ids)):
+                    for j in range(len(obj_ids)):
+                        if i == j:
+                            continue
+                        if adjacent_objects(cs, obj_ids[i], obj_ids[j], "right"):
+                            predicates_true.append("AdjacentObjects")
 
                 # Record co-occurrences
                 for pred in predicates_true:

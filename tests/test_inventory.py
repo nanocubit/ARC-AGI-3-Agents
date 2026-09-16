@@ -353,6 +353,90 @@ class TestInventoryBuilding:
         assert inv.trajectory_split.test_count > 0
 
 
+class TestFullGridEvaluation:
+    """R1.2 regression tests: full-grid predicate evaluation.
+
+    Ensures objects outside the first 8 rows/cols are detected.
+    """
+
+    def test_occupied_detects_sprite_outside_sample_window(self) -> None:
+        """Object at (16,16) must be detected with full-grid evaluation."""
+        # Build a 20x20 grid with a sprite at row 16, col 16
+        row = tuple([0] * 20)
+        grid = [list(row) for _ in range(20)]
+        grid[16][16] = 1  # Non-background cell at (16, 16)
+        grid = tuple(tuple(r) for r in grid)
+
+        obj = GridObject(
+            object_id="o1", color=1,
+            cells=((16, 16),), bbox=(16, 16, 16, 16), area=1,
+        )
+        state = make_grid_state(grid=grid, objects=(obj,))
+        snap = CanonicalSnapshot.from_state(state)
+        receipt = make_receipt(
+            state_hash_before=snap.state_hash,
+            state_hash_after=snap.state_hash,
+        )
+        snapshots = {snap.state_hash: snap}
+        trajs = join_receipts_with_snapshots([receipt], snapshots)
+        inv = InventoryBuilder().build(trajs)
+
+        assert inv.data_completeness == "full"
+        assert inv.predicate_stats is not None
+        # Occupied must be > 0 — the bug was that 8x8 sampling missed row 16
+        occupied_stats = inv.predicate_stats.get("Occupied")
+        assert occupied_stats is not None
+        assert occupied_stats.true_count > 0, (
+            f"Occupied should be > 0 with full-grid eval, got {occupied_stats.true_count}"
+        )
+
+    def test_full_grid_evaluates_all_cells(self) -> None:
+        """Full grid evaluation should count all cells, not just 64."""
+        # 12x12 grid with one non-background cell at (11, 11)
+        row = tuple([0] * 12)
+        grid = [list(row) for _ in range(12)]
+        grid[11][11] = 1
+        grid = tuple(tuple(r) for r in grid)
+
+        state = make_grid_state(grid=grid)
+        snap = CanonicalSnapshot.from_state(state)
+        receipt = make_receipt(
+            state_hash_before=snap.state_hash,
+            state_hash_after=snap.state_hash,
+        )
+        snapshots = {snap.state_hash: snap}
+        trajs = join_receipts_with_snapshots([receipt], snapshots)
+        inv = InventoryBuilder().build(trajs)
+
+        # Full grid: 144 cells evaluated
+        empty_stats = inv.predicate_stats.get("Empty")
+        assert empty_stats is not None
+        assert empty_stats.eval_count == 144  # 12*12
+        assert empty_stats.true_count == 143  # 144 - 1
+
+    def test_color_at_all_colors(self) -> None:
+        """ColorAt should evaluate for all colors present, not just top 4."""
+        # Grid with 5 colors
+        grid = (
+            (0, 1, 2, 3, 4),
+            (0, 0, 0, 0, 0),
+        )
+        state = make_grid_state(grid=grid)
+        snap = CanonicalSnapshot.from_state(state)
+        receipt = make_receipt(
+            state_hash_before=snap.state_hash,
+            state_hash_after=snap.state_hash,
+        )
+        snapshots = {snap.state_hash: snap}
+        trajs = join_receipts_with_snapshots([receipt], snapshots)
+        inv = InventoryBuilder().build(trajs)
+
+        # All 5 colors should be in predicate stats
+        for color in range(5):
+            key = f"ColorAt({color})"
+            assert key in inv.predicate_stats, f"Missing ColorAt({color})"
+
+
 class TestReportGeneration:
     """Test markdown report generation."""
 
