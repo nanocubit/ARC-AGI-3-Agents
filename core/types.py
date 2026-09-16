@@ -7,12 +7,12 @@ from typing import Literal
 @dataclass(frozen=True)
 class GridObject:
     """Immutable representation of a connected object in the grid.
-    
+
     Coordinates use (row, col) convention with (0, 0) at top-left.
     """
 
     object_id: str  # Deterministic ID based on object properties
-    color: int  # 0-9 ARC color value
+    color: int  # Palette index value
     cells: tuple[tuple[int, int], ...]  # Sorted immutable set of (row, col)
     bbox: tuple[int, int, int, int]  # (min_row, min_col, max_row, max_col)
     area: int  # Number of cells
@@ -21,12 +21,12 @@ class GridObject:
 @dataclass(frozen=True)
 class CanonicalState:
     """Canonical, immutable representation of observable game state.
-    
+
     All fields are deterministic primitives suitable for hashing and
     JSON serialization. Contains no raw SDK objects.
     """
 
-    grid: tuple[tuple[int, ...], ...]  # 2D tuple of integers (colors)
+    grid: tuple[tuple[int, ...], ...]  # 2D tuple of palette indices
     objects: tuple[GridObject, ...]  # Sorted, deterministic order
     available_actions: tuple["CanonicalAction", ...]  # SDK actions normalized
     status: str | None  # Game state (e.g., "WIN", "GAME_OVER", "NOT_PLAYED")
@@ -36,7 +36,7 @@ class CanonicalState:
 @dataclass(frozen=True)
 class CanonicalAction:
     """Immutable representation of an action suitable for hashing and equality.
-    
+
     Preserves enough information to reconstruct or identify the original
     SDK GameAction without storing the raw object.
     """
@@ -60,14 +60,14 @@ class StateDelta:
 @dataclass(frozen=True)
 class ActionReceipt:
     """Immutable receipt of a single attempted action and its outcome.
-    
+
     No raw SDK objects. All fields are deterministic primitives suitable
     for JSON serialization.
     """
 
-    receipt_id: str  # UUID
+    receipt_id: str  # Deterministic ID derived from receipt content
     game_id: str
-    level_id: str
+    derived_level_key: str  # Derived from game_id + levels_completed
     step_index: int
     state_hash_before: str  # SHA-256 hex
     action_hash: str  # SHA-256 hex
@@ -75,3 +75,4 @@ class ActionReceipt:
     state_hash_after: str  # SHA-256 hex
     actual_delta: StateDelta
     verification_outcome: Literal["confirmed", "contradicted", "unknown"]
+    schema_version: str = "1"

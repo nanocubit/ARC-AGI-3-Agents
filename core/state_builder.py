@@ -1,9 +1,8 @@
 """Convert SDK FrameData to canonical state representation."""
 
 import logging
-from typing import Any
 
-from arcengine import FrameData
+from arcengine import FrameData, GameAction
 
 from .hashing import state_hash
 from .types import CanonicalAction, CanonicalState, GridObject, StateDelta
@@ -11,66 +10,158 @@ from .types import CanonicalAction, CanonicalState, GridObject, StateDelta
 logger = logging.getLogger(__name__)
 
 
-def _extract_grid(frame_data: FrameData) -> tuple[tuple[int, ...], ...]:
-    """Extract and normalize grid from FrameData.
-    
-    Handles:
-    - Missing/None grid
-    - Empty grid
-    - Irregular dimensions
-    - Non-integer values
-    
+# ---------------------------------------------------------------------------
+# Frame extraction and grid normalization
+# ---------------------------------------------------------------------------
+
+
+def _extract_rendered_frame(frame_data: FrameData) -> list[list[int]]:
+    """Select the last rendered frame from the frame sequence.
+
+    SDK FrameData.frame is a sequence of 2D palette-index grids rendered
+    during a single action. We canonicalize only the final observed state.
+
+    Args:
+        frame_data: SDK frame data object.
+
     Returns:
-        Tuple of tuples representing normalized grid, or empty grid if invalid.
+        2D list of palette indices (last rendered frame).
+
+    Raises:
+        ValueError: If frame is missing, empty, or has no valid frames.
     """
     if not hasattr(frame_data, "frame") or frame_data.frame is None:
-        logger.warning("FrameData has no frame attribute")
+        raise ValueError("FrameData has no frame attribute or frame is None")
+
+    frames = frame_data.frame
+    if not frames:
+        raise ValueError("FrameData.frame is empty")
+
+    last_frame = frames[-1]
+    if last_frame is None:
+        raise ValueError("Last rendered frame is None")
+    if not last_frame:
+        raise ValueError("Last rendered frame is empty")
+
+    return last_frame
+
+
+def _normalize_palette_index_grid(
+    frame: list[list[int]],
+) -> tuple[tuple[int, ...], ...]:
+    """Convert a 2D list of palette indices to immutable tuple form.
+
+    Validates that every cell is a non-negative integer. Does not
+    silently coerce invalid values to 0.
+
+    Args:
+        frame: 2D list of palette index values.
+
+    Returns:
+        Tuple of tuples representing the normalized grid.
+
+    Raises:
+        ValueError: If any cell is not a non-negative integer, or if
+            rows have irregular lengths.
+    """
+    if not frame:
         return ((),)
 
-    frame_data_raw = frame_data.frame
-    if not frame_data_raw:
-        # Empty grid
-        return ((),)
+    normalized: list[list[int]] = []
+    expected_width: int | None = None
 
-    try:
-        # Normalize to list of lists of ints
-        normalized: list[list[int]] = []
-        for row in frame_data_raw:
-            if row is None:
-                continue
-            normalized_row: list[int] = []
-            for cell in row:
-                if isinstance(cell, (int, float)):
-                    normalized_row.append(int(cell))
-                else:
-                    logger.warning(f"Non-numeric cell value: {cell}, treating as 0")
-                    normalized_row.append(0)
-            if normalized_row:
-                normalized.append(normalized_row)
+    for row_idx, row in enumerate(frame):
+        if row is None:
+            raise ValueError(f"Row {row_idx} is None")
 
-        if not normalized:
-            return ((),)
+        normalized_row: list[int] = []
+        if expected_width is None:
+            expected_width = len(row)
 
-        # Check for irregular dimensions
-        row_lengths = [len(r) for r in normalized]
-        if len(set(row_lengths)) > 1:
-            logger.warning(
-                f"Irregular grid: row lengths {row_lengths}. Padding to max width."
+        if len(row) != expected_width:
+            raise ValueError(
+                f"Irregular grid: row {row_idx} has width {len(row)}, "
+                f"expected {expected_width}"
             )
-            max_width = max(row_lengths)
-            for row in normalized:
-                while len(row) < max_width:
-                    row.append(0)
 
-        return tuple(tuple(row) for row in normalized)
-    except (TypeError, ValueError) as e:
-        logger.error(f"Failed to normalize grid: {e}")
+        for col_idx, cell in enumerate(row):
+            # Reject bools (isinstance(True, int) is True in Python)
+            if isinstance(cell, bool):
+                raise TypeError(
+                    f"Cell ({row_idx}, {col_idx}) is bool, not int: {cell}"
+                )
+            if not isinstance(cell, (int, float)):
+                raise TypeError(
+                    f"Cell ({row_idx}, {col_idx}) is not numeric: {cell!r}"
+                )
+            cell_int = int(cell)
+            if cell_int < 0:
+                raise ValueError(
+                    f"Cell ({row_idx}, {col_idx}) is negative: {cell_int}"
+                )
+            normalized_row.append(cell_int)
+
+        if normalized_row:
+            normalized.append(normalized_row)
+
+    if not normalized:
         return ((),)
+
+    return tuple(tuple(row) for row in normalized)
+
+
+def _validate_canonical_grid(grid: tuple[tuple[int, ...], ...]) -> None:
+    """Validate that a canonical grid is well-formed.
+
+    Args:
+        grid: Tuple of tuples of non-negative integers.
+
+    Raises:
+        ValueError: If the grid is malformed.
+    """
+    if not grid:
+        raise ValueError("Canonical grid is empty")
+
+    expected_width = len(grid[0])
+    if expected_width == 0:
+        raise ValueError("Canonical grid has zero-width rows")
+
+    for row_idx, row in enumerate(grid):
+        if len(row) != expected_width:
+            raise ValueError(
+                f"Canonical grid row {row_idx} has width {len(row)}, "
+                f"expected {expected_width}"
+            )
+
+
+def _extract_grid(frame_data: FrameData) -> tuple[tuple[int, ...], ...]:
+    """Extract and normalize the canonical grid from FrameData.
+
+    Pipeline:
+        1. Select last rendered frame from the frame sequence.
+        2. Normalize 2D palette-index list to immutable tuple form.
+        3. Validate the resulting canonical grid.
+
+    Args:
+        frame_data: SDK frame data object.
+
+    Returns:
+        Tuple of tuples representing the canonical grid.
+    """
+    last_frame = _extract_rendered_frame(frame_data)
+    grid = _normalize_palette_index_grid(last_frame)
+    _validate_canonical_grid(grid)
+    return grid
+
+
+# ---------------------------------------------------------------------------
+# Object extraction
+# ---------------------------------------------------------------------------
 
 
 def _extract_objects(grid: tuple[tuple[int, ...], ...]) -> tuple[GridObject, ...]:
     """Extract connected components from grid using 4-neighbor connectivity.
-    
+
     Returns:
         Sorted tuple of GridObject instances (deterministic order).
     """
@@ -86,7 +177,7 @@ def _extract_objects(grid: tuple[tuple[int, ...], ...]) -> tuple[GridObject, ...
         start_r: int, start_c: int, color: int
     ) -> tuple[list[tuple[int, int]], int, int, int, int]:
         """Flood fill to find connected component.
-        
+
         Returns: (cells, min_r, min_c, max_r, max_c)
         """
         stack = [(start_r, start_c)]
@@ -156,6 +247,11 @@ def _extract_objects(grid: tuple[tuple[int, ...], ...]) -> tuple[GridObject, ...
     return sorted_objects
 
 
+# ---------------------------------------------------------------------------
+# Status and action extraction
+# ---------------------------------------------------------------------------
+
+
 def _state_status(frame_data: FrameData) -> str | None:
     """Extract and normalize game status from FrameData."""
     if hasattr(frame_data, "state") and frame_data.state is not None:
@@ -169,8 +265,16 @@ def _state_status(frame_data: FrameData) -> str | None:
 def _extract_canonical_actions(
     frame_data: FrameData,
 ) -> tuple[CanonicalAction, ...]:
-    """Convert SDK GameAction list to CanonicalAction tuple.
-    
+    """Convert SDK available_actions (list[int]) to CanonicalAction tuple.
+
+    SDK provides available_actions as a list of integer action IDs.
+    We convert each to a GameAction enum via from_id(), then extract
+    the name and ID. No raw SDK objects are stored.
+
+    For ACTION6, complex_data is None because coordinates are not
+    known at the available_actions level — they are only set when
+    the agent selects a specific action.
+
     Returns:
         Sorted tuple of canonical actions (deterministic order).
     """
@@ -178,38 +282,22 @@ def _extract_canonical_actions(
         return ()
 
     canonical_actions: list[CanonicalAction] = []
-    for action in frame_data.available_actions:
+    for action_id in frame_data.available_actions:
         try:
-            action_name = action.name
-            action_id = action.value if hasattr(action, "value") else 0
+            if not isinstance(action_id, int) or isinstance(action_id, bool):
+                logger.warning(f"Skipping non-integer action: {action_id!r}")
+                continue
 
-            # ACTION6 is complex; try to extract data
-            complex_data = None
-            if action_name == "ACTION6" and hasattr(action, "action_data"):
-                try:
-                    data = action.action_data
-                    if hasattr(data, "model_dump"):
-                        data_dict = data.model_dump()
-                    elif isinstance(data, dict):
-                        data_dict = data
-                    else:
-                        data_dict = {}
-
-                    # Extract x, y if present
-                    if data_dict:
-                        items = sorted(data_dict.items())
-                        complex_data = tuple(items)
-                except Exception as e:
-                    logger.debug(f"Failed to extract complex data from {action}: {e}")
+            sdk_action = GameAction.from_id(action_id)
 
             canonical = CanonicalAction(
-                action_name=action_name,
-                action_id=action_id,
-                complex_data=complex_data,
+                action_name=sdk_action.name,
+                action_id=sdk_action.value,
+                complex_data=None,
             )
             canonical_actions.append(canonical)
-        except Exception as e:
-            logger.warning(f"Failed to canonicalize action {action}: {e}")
+        except Exception as e:  # noqa: BLE001 - action extraction must not crash
+            logger.warning(f"Failed to canonicalize action {action_id}: {e}")
 
     # Sort deterministically by action_id, then name
     sorted_actions = tuple(
@@ -221,12 +309,17 @@ def _extract_canonical_actions(
     return sorted_actions
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
 def build_canonical_state(frame_data: FrameData) -> CanonicalState:
     """Convert SDK FrameData to CanonicalState.
-    
+
     Args:
         frame_data: SDK frame data object.
-        
+
     Returns:
         Immutable, hashable canonical state.
     """
@@ -261,13 +354,13 @@ def compute_state_delta(
     state_before: CanonicalState, state_after: CanonicalState
 ) -> StateDelta:
     """Compute deterministic delta between two consecutive states.
-    
+
     Conservative approach: only identify exact matches.
-    
+
     Args:
         state_before: Previous canonical state.
         state_after: Current canonical state.
-        
+
     Returns:
         StateDelta describing changes.
     """
@@ -311,9 +404,8 @@ def compute_state_delta(
             removed_objects.append(obj_id)
 
     # Moved objects: if same object exists, check if bbox changed
-    for obj_id in before_obj_map:
+    for obj_id, before_obj in before_obj_map.items():
         if obj_id in after_obj_map:
-            before_obj = before_obj_map[obj_id]
             after_obj = after_obj_map[obj_id]
             if before_obj.bbox != after_obj.bbox:
                 # Object moved; use bbox center as position proxy

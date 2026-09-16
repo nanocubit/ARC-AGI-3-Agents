@@ -2,7 +2,6 @@ import os
 import shutil
 
 import pytest
-
 from arcengine import FrameData, GameState
 
 
@@ -43,9 +42,16 @@ def temp_recordings_dir(clean_test_recordings):
 
 @pytest.fixture
 def sample_frame():
+    """A FrameData with a 2x2 grid of palette indices.
+
+    FrameData.frame is list[list[list[int]]] — a sequence of 2D
+    palette-index grids. This fixture provides one frame with:
+      [0, 1]
+      [2, 3]
+    """
     return FrameData(
         game_id="test-game",
-        frame=[[[1, 2], [3, 4]]],
+        frame=[[[0, 1], [2, 3]]],
         state=GameState.NOT_FINISHED,
         levels_completed=5,
     )

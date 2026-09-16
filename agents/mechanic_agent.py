@@ -13,12 +13,12 @@ No controller, solver, planner, or LLM at this stage.
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 from arcengine import FrameData, GameAction
 
 from agents.agent import Agent
-from core.hashing import action_hash, state_hash
+from core.hashing import action_hash
 from core.receipts import ReceiptWriter
 from core.state_builder import build_canonical_state, compute_state_delta
 from core.types import ActionReceipt, CanonicalAction, CanonicalState
@@ -35,12 +35,12 @@ class PendingActionContext:
     selected_action: CanonicalAction
     step_index: int
     game_id: str
-    level_id: str
+    derived_level_key: str
 
 
 class MechanicAgent(Agent):
     """Milestone 1 agent: canonical state + deterministic receipts.
-    
+
     Does NOT call arc_env.step() directly.
     Returns GameAction from choose_action() only.
     """
@@ -48,16 +48,16 @@ class MechanicAgent(Agent):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.receipt_writer = ReceiptWriter()
-        self.pending_action: Optional[PendingActionContext] = None
+        self.pending_action: PendingActionContext | None = None
         logger.info(f"MechanicAgent initialized for game {self.game_id}")
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         """Decide if the agent is done playing.
-        
+
         Args:
             frames: All frames in episode.
             latest_frame: Most recent frame.
-            
+
         Returns:
             True if game is complete.
         """
@@ -69,11 +69,27 @@ class MechanicAgent(Agent):
 
         return False
 
+    def _derive_level_key(self, latest_frame: FrameData) -> str:
+        """Derive a level identity from available SDK fields.
+
+        levels_completed is a count of completed levels, not a true
+        level ID. We use it as a derived level context key, clearly
+        labeled as derived rather than SDK-provided.
+
+        Args:
+            latest_frame: Current frame.
+
+        Returns:
+            Derived level key string.
+        """
+        levels_completed = getattr(latest_frame, "levels_completed", 0) or 0
+        return f"{self.game_id}:level:{levels_completed}"
+
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
         """Choose next action.
-        
+
         Lifecycle:
         1. Convert latest_frame to CanonicalState
         2. Verify pending previous action (if any)
@@ -82,20 +98,22 @@ class MechanicAgent(Agent):
         5. Select deterministic fallback action
         6. Remember pending action context
         7. Return SDK GameAction
-        
+
         Args:
             frames: All frames in episode.
             latest_frame: Current frame.
-            
+
         Returns:
             SDK GameAction for the harness to execute.
         """
         # 1. Convert to canonical state
         try:
             canonical_state = build_canonical_state(latest_frame)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - receipt I/O must not crash agent
             logger.error(f"Failed to build canonical state: {e}")
             return GameAction.RESET
+
+        derived_level_key = self._derive_level_key(latest_frame)
 
         # 2 & 3. Verify previous action and compute delta if applicable
         if self.pending_action is not None:
@@ -107,21 +125,32 @@ class MechanicAgent(Agent):
                 # 4. Determine verification outcome (conservative: default to "unknown")
                 verification_outcome = self._verify_action(delta)
 
+                act_hash = action_hash(self.pending_action.selected_action)
+
                 # 5. Write receipt for previous action
-                receipt = ActionReceipt(
-                    receipt_id=ReceiptWriter.generate_receipt_id(),
+                receipt_id = ReceiptWriter.generate_receipt_id(
                     game_id=self.pending_action.game_id,
-                    level_id=self.pending_action.level_id,
+                    derived_level_key=self.pending_action.derived_level_key,
                     step_index=self.pending_action.step_index,
                     state_hash_before=self.pending_action.state_hash_before,
-                    action_hash=action_hash(self.pending_action.selected_action),
+                    action_hash=act_hash,
+                    state_hash_after=canonical_state.state_hash,
+                )
+
+                receipt = ActionReceipt(
+                    receipt_id=receipt_id,
+                    game_id=self.pending_action.game_id,
+                    derived_level_key=self.pending_action.derived_level_key,
+                    step_index=self.pending_action.step_index,
+                    state_hash_before=self.pending_action.state_hash_before,
+                    action_hash=act_hash,
                     selected_action=self.pending_action.selected_action,
                     state_hash_after=canonical_state.state_hash,
                     actual_delta=delta,
                     verification_outcome=verification_outcome,
                 )
                 self.receipt_writer.write(receipt)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - receipt I/O must not crash agent
                 logger.error(f"Failed to verify previous action: {e}")
 
         # 6. Select deterministic fallback action
@@ -134,7 +163,7 @@ class MechanicAgent(Agent):
             selected_action=selected_action,
             step_index=self.action_counter,
             game_id=self.game_id,
-            level_id=latest_frame.game_id or "unknown",
+            derived_level_key=derived_level_key,
         )
 
         # 8. Convert canonical action back to SDK GameAction
@@ -143,13 +172,13 @@ class MechanicAgent(Agent):
 
     def _verify_action(self, delta: Any) -> str:
         """Determine verification outcome for the previous action.
-        
+
         Milestone 1: No prediction engine, so outcome is "unknown" by default.
         Future milestones will implement hypothesis-based verification.
-        
+
         Args:
             delta: The computed StateDelta.
-            
+
         Returns:
             One of: "confirmed", "contradicted", "unknown"
         """
@@ -158,15 +187,15 @@ class MechanicAgent(Agent):
 
     def _select_fallback_action(self, state: CanonicalState) -> CanonicalAction:
         """Select a deterministic fallback action.
-        
+
         Policy:
         - Only select from available actions
         - Use deterministic tie-breaking (sorted by action_id, then name)
         - Never fabricate unavailable actions
-        
+
         Args:
             state: Current canonical state.
-            
+
         Returns:
             Deterministically selected CanonicalAction.
         """
@@ -187,11 +216,11 @@ class MechanicAgent(Agent):
         self, canonical: CanonicalAction, latest_frame: FrameData
     ) -> GameAction:
         """Convert CanonicalAction back to SDK GameAction.
-        
+
         Args:
             canonical: The canonical action to convert.
             latest_frame: Current frame (for context).
-            
+
         Returns:
             SDK GameAction ready for the harness.
         """
